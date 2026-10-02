@@ -228,3 +228,92 @@ async function backtrack(end, start, parent, dir){
     }
 
 }
+
+async function FloodFillSearch(maze, start, end) {
+
+    let distance = new Map()
+    let queue = []
+
+    // Initialize every cell with infinity
+    maze.matrix.forEach(row => {
+        row.forEach(node => {
+            distance.set(node, Infinity)
+        })
+    })
+
+    // Goal has distance 0
+    distance.set(end, 0)
+    queue.push(end)
+
+    // Flood Fill from goal
+    while(queue.length) {
+
+        let node = queue.shift()
+        let currentDistance = distance.get(node)
+
+        node.el.innerHTML = currentDistance
+
+        await sleep(20)
+
+        for(let i = 0; i < node.sides; ++i) {
+
+            let neighbor = node.neighbors[i]
+
+            // Check if neighbor exists and there is no wall
+            if(neighbor && !node.border[i]) {
+
+                if(distance.get(neighbor) > currentDistance + 1) {
+
+                    distance.set(neighbor, currentDistance + 1)
+                    queue.push(neighbor)
+
+                    neighbor.addClass("searching")
+                }
+            }
+        }
+    }
+
+    // Remove searching animation
+    maze.matrix.forEach(row => {
+        row.forEach(node => {
+            node.removeClass("searching")
+        })
+    })
+
+    // Follow lowest distance from START to GOAL
+    let current = start
+
+    while(current != end) {
+
+        current.addClass("inWay")
+
+        let bestNeighbor = null
+        let bestDistance = Infinity
+
+        for(let i = 0; i < current.sides; ++i) {
+
+            let neighbor = current.neighbors[i]
+
+            if(
+                neighbor &&
+                !current.border[i] &&
+                distance.get(neighbor) < bestDistance
+            ) {
+                bestNeighbor = neighbor
+                bestDistance = distance.get(neighbor)
+            }
+        }
+
+        // No path exists
+        if(!bestNeighbor) {
+            console.log("No path found")
+            return
+        }
+
+        await sleep(100)
+
+        current = bestNeighbor
+    }
+
+    end.addClass("inWay")
+}

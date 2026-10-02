@@ -44,7 +44,9 @@ function start(){
         case "dfs":
             DFSsearch(maze, maze.startNode, maze.endNode)
             break
-
+        case "floodfill":
+            FloodFillSearch(maze, maze.startNode, maze.endNode)
+            break
     }
 }
 
