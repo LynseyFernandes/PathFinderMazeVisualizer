@@ -1,14 +1,18 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <VL53L0X.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <Preferences.h>
 
 constexpr uint8_t SDA_PIN = 21;
 constexpr uint8_t SCL_PIN = 22;
-constexpr uint8_t PCA_ADDR = 0x40;
+constexpr uint8_t PCA9685_ADDR = 0x40;
+constexpr uint8_t PCA9548A_ADDR = 0x70;
 
 constexpr uint8_t QTR_COUNT = 8;
-const uint8_t QTR_PINS[QTR_COUNT] = {4, 16, 17, 18, 19, 27, 32, 33};
+constexpr uint8_t QTR_PINS[QTR_COUNT] = {4, 16, 17, 18, 19, 27, 32, 33};
 
 constexpr uint8_t FL_PWM = 13;
 constexpr uint8_t FR_PWM = 14;
@@ -25,50 +29,63 @@ constexpr uint8_t RR_A = 9;
 constexpr uint8_t RR_B = 10;
 constexpr uint8_t STBY_CH = 11;
 
-constexpr bool MOTOR_INVERT_FL = false;
-constexpr bool MOTOR_INVERT_FR = true;
-constexpr bool MOTOR_INVERT_RL = false;
-constexpr bool MOTOR_INVERT_RR = true;
+bool motorInvert[4] = {false, true, false, true};
+int8_t motorDirState[4] = {0, 0, 0, 0};
+
+constexpr uint8_t TOF_CHANNEL[3] = {0, 1, 2};
+constexpr uint8_t TOF_COUNT = 3;
+constexpr uint8_t TOF_ADDR = 0x29;
+
+constexpr uint8_t LEFT_TOF = 0;
+constexpr uint8_t FRONT_TOF = 1;
+constexpr uint8_t RIGHT_TOF = 2;
 
 constexpr bool LINE_IS_WHITE = true;
 constexpr bool SENSOR_ORDER_REVERSED = false;
 
 constexpr uint16_t QTR_CHARGE_US = 10;
 constexpr uint16_t QTR_TIMEOUT_US = 3000;
-constexpr uint16_t CALIBRATION_MS = 8000;
-
-constexpr uint8_t TRACK_0 = 2;
-constexpr uint8_t TRACK_1 = 3;
-constexpr uint8_t TRACK_2 = 4;
-constexpr uint8_t TRACK_3 = 5;
-
-constexpr uint16_t LINE_MIN_STRENGTH = 80;
+constexpr uint16_t QTR_CAL_MS = 8000;
 constexpr uint16_t LINE_VALID_TOTAL = 140;
-constexpr uint16_t SIDE_TURN_STRENGTH = 600;
-constexpr uint16_t LOST_TIMEOUT_MS = 250;
+constexpr uint16_t LINE_MIN_STRENGTH = 80;
+constexpr uint32_t LINE_PERIOD_US = 2500;
+constexpr uint16_t LINE_LOST_MS = 180;
 
-constexpr uint8_t ERROR_BUFFER_SIZE = 4;
-constexpr uint32_t CONTROL_PERIOD_US = 3000;
+constexpr uint16_t TOF_PERIOD_MS = 20;
+constexpr uint16_t TOF_TIMEOUT_MS = 60;
+constexpr uint16_t DEFAULT_WALL_TARGET_MM = 100;
+constexpr uint16_t DEFAULT_FRONT_STOP_MM = 90;
 
-constexpr int16_t PWM_MIN = 0;
-constexpr int16_t PWM_MAX = 255;
+constexpr uint8_t ERROR_HISTORY = 6;
 
-constexpr float DEFAULT_KP = 80.0f;
-constexpr float DEFAULT_KI = 0.0f;
-constexpr float DEFAULT_KD = 0.03f;
-constexpr float DEFAULT_BASE = 135.0f;
-constexpr float DEFAULT_MIN_BASE = 90.0f;
-constexpr float DEFAULT_MAX_BASE = 230.0f;
-constexpr float DEFAULT_D_FILTER = 0.65f;
+constexpr float DEFAULT_LINE_KP = 80.0f;
+constexpr float DEFAULT_LINE_KI = 0.0f;
+constexpr float DEFAULT_LINE_KD = 0.03f;
+constexpr float DEFAULT_LINE_BASE = 110.0f;
 
-struct Calibration {
-  uint16_t minUs[QTR_COUNT];
-  uint16_t maxUs[QTR_COUNT];
-  bool valid;
+constexpr float DEFAULT_WALL_KP = 2.0f;
+constexpr float DEFAULT_WALL_KI = 0.0f;
+constexpr float DEFAULT_WALL_KD = 0.08f;
+constexpr float DEFAULT_WALL_BASE = 110.0f;
+
+constexpr float DEFAULT_HEADING_KP = 2.5f;
+constexpr float DEFAULT_HEADING_KI = 0.0f;
+constexpr float DEFAULT_HEADING_KD = 0.12f;
+constexpr float DEFAULT_HEADING_BASE = 90.0f;
+
+struct PIDConfig {
+  float kp;
+  float ki;
+  float kd;
+  float base;
+  float integralLimit;
+  float dFilter;
+  float maxCorrection;
+  float sign;
 };
 
-struct LineSample {
-  uint16_t rawUs[QTR_COUNT];
+struct LineState {
+  uint16_t raw[QTR_COUNT];
   uint16_t strength[QTR_COUNT];
   uint8_t mask;
   float error;
@@ -80,47 +97,90 @@ struct ErrorSample {
   uint32_t timeUs;
 };
 
-struct PIDConfig {
-  float kp;
-  float ki;
-  float kd;
-  float base;
-  float minBase;
-  float maxBase;
-  float dFilter;
-  float integralLimit;
-};
-
-Adafruit_PWMServoDriver pca(PCA_ADDR);
+Adafruit_PWMServoDriver pca(PCA9685_ADDR);
+VL53L0X tof[TOF_COUNT];
+Adafruit_MPU6050 mpu;
 Preferences prefs;
-Calibration cal{};
-LineSample line{};
-PIDConfig cfg{
-  DEFAULT_KP,
-  DEFAULT_KI,
-  DEFAULT_KD,
-  DEFAULT_BASE,
-  DEFAULT_MIN_BASE,
-  DEFAULT_MAX_BASE,
-  DEFAULT_D_FILTER,
-  0.8f
+
+PIDConfig lineCfg{
+  DEFAULT_LINE_KP,
+  DEFAULT_LINE_KI,
+  DEFAULT_LINE_KD,
+  DEFAULT_LINE_BASE,
+  0.8f,
+  0.65f,
+  255.0f,
+  1.0f
 };
 
-ErrorSample history[ERROR_BUFFER_SIZE]{};
-uint8_t historyHead = 0;
-uint8_t historyCount = 0;
+PIDConfig wallCfg{
+  DEFAULT_WALL_KP,
+  DEFAULT_WALL_KI,
+  DEFAULT_WALL_KD,
+  DEFAULT_WALL_BASE,
+  0.8f,
+  0.65f,
+  255.0f,
+  1.0f
+};
+
+PIDConfig headingCfg{
+  DEFAULT_HEADING_KP,
+  DEFAULT_HEADING_KI,
+  DEFAULT_HEADING_KD,
+  DEFAULT_HEADING_BASE,
+  200.0f,
+  0.65f,
+  255.0f,
+  1.0f
+};
+
+LineState lineState{};
+ErrorSample errorHistory[ERROR_HISTORY]{};
+
+uint8_t errorHead = 0;
+uint8_t errorCount = 0;
 float integral = 0.0f;
 float filteredDerivative = 0.0f;
-float lastSeenError = 0.0f;
+float lastLineError = 0.0f;
 int8_t lastLineSide = 1;
-uint8_t motorState[4] = {0, 0, 0, 0};
-uint32_t lastControlUs = 0;
 uint32_t lastValidLineMs = 0;
+uint32_t lastLineControlUs = 0;
+
+uint16_t tofMM[TOF_COUNT] = {0, 0, 0};
+bool tofValid[TOF_COUNT] = {false, false, false};
+uint32_t lastToFMs = 0;
+uint16_t wallTargetMM = DEFAULT_WALL_TARGET_MM;
+uint16_t frontStopMM = DEFAULT_FRONT_STOP_MM;
+
+float gyroBiasZ = 0.0f;
+float yawDeg = 0.0f;
+float headingTargetDeg = 0.0f;
+float gyroScale = 1.0f;
+uint32_t lastIMUUs = 0;
+bool imuReady = false;
+
+uint8_t wallMode = 0;
+bool frontSafety = true;
+bool adaptiveLine = false;
 uint32_t lastPrintMs = 0;
-bool running = false;
-bool adaptiveEnabled = true;
-bool initialized = false;
+uint32_t lastMotorUs = 0;
+uint32_t lastPidUs = 0;
+uint8_t tofRoundRobin = 0;
+uint16_t qtrMinUs[QTR_COUNT]{};
+uint16_t qtrMaxUs[QTR_COUNT]{};
+bool qtrCalLoaded = false;
 String commandLine;
+
+enum ControlMode : uint8_t {
+  MODE_STOP,
+  MODE_LINE,
+  MODE_WALL,
+  MODE_HEADING,
+  MODE_TURN
+};
+
+ControlMode mode = MODE_STOP;
 
 float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
@@ -134,6 +194,30 @@ int clampi(int x, int lo, int hi) {
   return x;
 }
 
+float wrapAngle(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a < -180.0f) a += 360.0f;
+  return a;
+}
+
+PIDConfig &activeCfg() {
+  if (mode == MODE_LINE) return lineCfg;
+  if (mode == MODE_WALL) return wallCfg;
+  return headingCfg;
+}
+
+void selectMux(uint8_t channel) {
+  Wire.beginTransmission(PCA9548A_ADDR);
+  Wire.write((uint8_t)(1u << channel));
+  Wire.endTransmission();
+}
+
+void deselectMux() {
+  Wire.beginTransmission(PCA9548A_ADDR);
+  Wire.write((uint8_t)0);
+  Wire.endTransmission();
+}
+
 void pcaHigh(uint8_t ch) {
   pca.setPin(ch, 4095, false);
 }
@@ -142,44 +226,52 @@ void pcaLow(uint8_t ch) {
   pca.setPin(ch, 0, false);
 }
 
-void setMotorDir(uint8_t a, uint8_t b, bool forward, bool invert) {
-  if (invert) forward = !forward;
+void setMotorDirection(uint8_t index, bool forward) {
+  const uint8_t a[4] = {FL_A, FR_A, RL_A, RR_A};
+  const uint8_t b[4] = {FL_B, FR_B, RL_B, RR_B};
+
+  if (motorInvert[index]) forward = !forward;
+
   if (forward) {
-    pcaHigh(a);
-    pcaLow(b);
+    pcaHigh(a[index]);
+    pcaLow(b[index]);
   } else {
-    pcaLow(a);
-    pcaHigh(b);
+    pcaLow(a[index]);
+    pcaHigh(b[index]);
   }
 }
 
-void setMotorOutput(uint8_t index, uint8_t pwmPin, uint8_t a, uint8_t b, bool invert, int command) {
-  command = clampi(command, -PWM_MAX, PWM_MAX);
+void setMotor(uint8_t index, int command) {
+  const uint8_t pwm[4] = {FL_PWM, FR_PWM, RL_PWM, RR_PWM};
+  const uint8_t a[4] = {FL_A, FR_A, RL_A, RR_A};
+  const uint8_t b[4] = {FL_B, FR_B, RL_B, RR_B};
+
+  command = clampi(command, -255, 255);
 
   if (command == 0) {
-    if (motorState[index] != 0) {
-      pcaLow(a);
-      pcaLow(b);
-      motorState[index] = 0;
+    if (motorDirState[index] != 0) {
+      pcaLow(a[index]);
+      pcaLow(b[index]);
+      motorDirState[index] = 0;
     }
-    ledcWrite(pwmPin, 0);
+    ledcWrite(pwm[index], 0);
     return;
   }
 
-  uint8_t state = command > 0 ? 1 : 2;
-  if (motorState[index] != state) {
-    setMotorDir(a, b, command > 0, invert);
-    motorState[index] = state;
+  int8_t wanted = command > 0 ? 1 : -1;
+  if (motorDirState[index] != wanted) {
+    setMotorDirection(index, command > 0);
+    motorDirState[index] = wanted;
   }
 
-  ledcWrite(pwmPin, abs(command));
+  ledcWrite(pwm[index], abs(command));
 }
 
 void setTank(int left, int right) {
-  setMotorOutput(0, FL_PWM, FL_A, FL_B, MOTOR_INVERT_FL, left);
-  setMotorOutput(1, FR_PWM, FR_A, FR_B, MOTOR_INVERT_FR, right);
-  setMotorOutput(2, RL_PWM, RL_A, RL_B, MOTOR_INVERT_RL, left);
-  setMotorOutput(3, RR_PWM, RR_A, RR_B, MOTOR_INVERT_RR, right);
+  setMotor(0, left);
+  setMotor(2, left);
+  setMotor(1, right);
+  setMotor(3, right);
 }
 
 void stopMotors() {
@@ -219,94 +311,106 @@ void readQTR(uint16_t out[QTR_COUNT]) {
   }
 }
 
-void resetControllerState() {
-  memset(history, 0, sizeof(history));
-  historyHead = 0;
-  historyCount = 0;
+void resetPID() {
+  memset(errorHistory, 0, sizeof(errorHistory));
+  errorHead = 0;
+  errorCount = 0;
   integral = 0.0f;
   filteredDerivative = 0.0f;
-  lastSeenError = 0.0f;
-  lastLineSide = 1;
-}
-
-void saveCalibration() {
-  prefs.begin("qtr", false);
-  prefs.putBool("valid", cal.valid);
-  for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-    char k1[5], k2[5];
-    snprintf(k1, sizeof(k1), "n%d", i);
-    snprintf(k2, sizeof(k2), "x%d", i);
-    prefs.putUShort(k1, cal.minUs[i]);
-    prefs.putUShort(k2, cal.maxUs[i]);
-  }
-  prefs.end();
-}
-
-bool loadCalibration() {
-  prefs.begin("qtr", true);
-  cal.valid = prefs.getBool("valid", false);
-  if (cal.valid) {
-    for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-      char k1[5], k2[5];
-      snprintf(k1, sizeof(k1), "n%d", i);
-      snprintf(k2, sizeof(k2), "x%d", i);
-      cal.minUs[i] = prefs.getUShort(k1, 0);
-      cal.maxUs[i] = prefs.getUShort(k2, QTR_TIMEOUT_US);
-      if (cal.maxUs[i] <= cal.minUs[i] + 30) cal.valid = false;
-    }
-  }
-  prefs.end();
-  return cal.valid;
+  lastPidUs = 0;
 }
 
 void calibrateQTR() {
   stopMotors();
+
+  uint16_t minUs[QTR_COUNT];
+  uint16_t maxUs[QTR_COUNT];
+  uint16_t sample[QTR_COUNT];
+
   for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-    cal.minUs[i] = QTR_TIMEOUT_US;
-    cal.maxUs[i] = 0;
+    minUs[i] = QTR_TIMEOUT_US;
+    maxUs[i] = 0;
   }
 
   Serial.println("CAL START");
-  Serial.println("MOVE SENSOR OVER LINE AND FLOOR FOR 8 SEC");
 
   uint32_t start = millis();
-  uint16_t samples[QTR_COUNT];
-  while (millis() - start < CALIBRATION_MS) {
-    readQTR(samples);
+  while (millis() - start < QTR_CAL_MS) {
+    readQTR(sample);
     for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-      if (samples[i] < cal.minUs[i]) cal.minUs[i] = samples[i];
-      if (samples[i] > cal.maxUs[i]) cal.maxUs[i] = samples[i];
+      if (sample[i] < minUs[i]) minUs[i] = sample[i];
+      if (sample[i] > maxUs[i]) maxUs[i] = sample[i];
     }
   }
 
-  cal.valid = true;
+  prefs.begin("qtr", false);
+  prefs.putBool("valid", true);
+
+  bool good = true;
+
   for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-    if (cal.maxUs[i] <= cal.minUs[i] + 30) cal.valid = false;
+    if (maxUs[i] <= minUs[i] + 30) good = false;
+
+    char a[5];
+    char b[5];
+    snprintf(a, sizeof(a), "n%d", i);
+    snprintf(b, sizeof(b), "x%d", i);
+
+    prefs.putUShort(a, minUs[i]);
+    prefs.putUShort(b, maxUs[i]);
   }
 
-  if (cal.valid) {
-    saveCalibration();
-    Serial.println("CAL OK");
-  } else {
-    Serial.println("CAL BAD");
+  prefs.putBool("valid", good);
+  prefs.end();
+
+  for (uint8_t i = 0; i < QTR_COUNT; ++i) {
+    qtrMinUs[i] = minUs[i];
+    qtrMaxUs[i] = maxUs[i];
   }
+  qtrCalLoaded = good;
+
+  Serial.println(good ? "CAL OK" : "CAL BAD");
 }
 
-uint16_t normalize(uint16_t raw, uint8_t i) {
-  uint16_t lo = cal.minUs[i];
-  uint16_t hi = cal.maxUs[i];
+uint16_t normalizedQTR(uint16_t raw, uint8_t i) {
+  uint16_t lo = qtrMinUs[i];
+  uint16_t hi = qtrMaxUs[i];
+
   if (hi <= lo + 5) return 0;
 
   raw = clampi(raw, lo, hi);
 
-  float v;
+  float value;
   if (LINE_IS_WHITE) {
-    v = (float)(hi - raw) / (float)(hi - lo);
+    value = (float)(hi - raw) / (float)(hi - lo);
   } else {
-    v = (float)(raw - lo) / (float)(hi - lo);
+    value = (float)(raw - lo) / (float)(hi - lo);
   }
 
-  return (uint16_t)(clampf(v, 0.0f, 1.0f) * 1000.0f);
+  return (uint16_t)(clampf(value, 0.0f, 1.0f) * 1000.0f);
+}
+
+bool qtrCalibrationValid() {
+  return qtrCalLoaded;
+}
+
+void loadQTRCalibration() {
+  prefs.begin("qtr", true);
+  qtrCalLoaded = prefs.getBool("valid", false);
+
+  if (qtrCalLoaded) {
+    for (uint8_t i = 0; i < QTR_COUNT; ++i) {
+      char a[5];
+      char b[5];
+      snprintf(a, sizeof(a), "n%d", i);
+      snprintf(b, sizeof(b), "x%d", i);
+      qtrMinUs[i] = prefs.getUShort(a, 0);
+      qtrMaxUs[i] = prefs.getUShort(b, QTR_TIMEOUT_US);
+      if (qtrMaxUs[i] <= qtrMinUs[i] + 30) qtrCalLoaded = false;
+    }
+  }
+
+  prefs.end();
 }
 
 void sampleLine() {
@@ -315,115 +419,176 @@ void sampleLine() {
      500,  1500,  2500,  3500
   };
 
-  int32_t weighted = 0;
-  uint32_t total = 0;
-  uint8_t mask = 0;
+  readQTR(lineState.raw);
 
-  readQTR(line.rawUs);
+  uint32_t total = 0;
+  int32_t weighted = 0;
+  uint8_t mask = 0;
 
   for (uint8_t i = 0; i < QTR_COUNT; ++i) {
     uint8_t logical = SENSOR_ORDER_REVERSED ? (QTR_COUNT - 1 - i) : i;
-    line.strength[logical] = normalize(line.rawUs[i], logical);
+    lineState.strength[logical] = normalizedQTR(lineState.raw[i], i);
 
-    if (line.strength[logical] >= LINE_MIN_STRENGTH) {
+    if (lineState.strength[logical] >= LINE_MIN_STRENGTH) {
       mask |= (uint8_t)(1u << logical);
     }
   }
 
-  for (uint8_t i = TRACK_0; i <= TRACK_3; ++i) {
-    weighted += (int32_t)line.strength[i] * weights[i];
-    total += line.strength[i];
+  for (uint8_t i = 2; i <= 5; ++i) {
+    weighted += (int32_t)lineState.strength[i] * weights[i];
+    total += lineState.strength[i];
   }
 
-  line.mask = mask;
-  line.valid = total >= LINE_VALID_TOTAL;
+  lineState.mask = mask;
+  lineState.valid = total >= LINE_VALID_TOTAL;
 
-  if (line.valid) {
-    line.error = clampf((float)weighted / ((float)total * 3500.0f), -1.0f, 1.0f);
-    lastSeenError = line.error;
+  if (lineState.valid) {
+    lineState.error = clampf(
+      (float)weighted / ((float)total * 3500.0f),
+      -1.0f,
+      1.0f
+    );
+
     lastValidLineMs = millis();
-    if (line.error > 0.03f) lastLineSide = 1;
-    if (line.error < -0.03f) lastLineSide = -1;
+    lastLineError = lineState.error;
+
+    if (lineState.error > 0.03f) lastLineSide = 1;
+    if (lineState.error < -0.03f) lastLineSide = -1;
   } else {
-    line.error = lastSeenError;
+    lineState.error = lastLineError;
   }
 }
 
 void updateDerivative(float error) {
   uint32_t now = micros();
-  history[historyHead] = {error, now};
-  historyHead = (historyHead + 1) % ERROR_BUFFER_SIZE;
-  if (historyCount < ERROR_BUFFER_SIZE) historyCount++;
 
-  if (historyCount < 2) {
+  errorHistory[errorHead] = {error, now};
+  errorHead = (errorHead + 1) % ERROR_HISTORY;
+
+  if (errorCount < ERROR_HISTORY) errorCount++;
+
+  if (errorCount < 2) {
     filteredDerivative = 0.0f;
     return;
   }
 
-  uint8_t newest = (historyHead + ERROR_BUFFER_SIZE - 1) % ERROR_BUFFER_SIZE;
-  uint8_t oldest = (historyHead + ERROR_BUFFER_SIZE - historyCount) % ERROR_BUFFER_SIZE;
-  uint32_t dtUs = history[newest].timeUs - history[oldest].timeUs;
+  uint8_t newest = (errorHead + ERROR_HISTORY - 1) % ERROR_HISTORY;
+  uint8_t oldest = (errorHead + ERROR_HISTORY - errorCount) % ERROR_HISTORY;
+
+  uint32_t dtUs = errorHistory[newest].timeUs - errorHistory[oldest].timeUs;
   if (dtUs < 1000) dtUs = 1000;
 
-  float rawD = (history[newest].error - history[oldest].error) / ((float)dtUs * 0.000001f);
-  rawD = clampf(rawD, -80.0f, 80.0f);
+  float rawD =
+    (errorHistory[newest].error - errorHistory[oldest].error) /
+    ((float)dtUs * 0.000001f);
+
+  rawD = clampf(rawD, -100.0f, 100.0f);
+
+  PIDConfig &cfg = activeCfg();
+
   filteredDerivative =
-      cfg.dFilter * filteredDerivative
-    + (1.0f - cfg.dFilter) * rawD;
+    cfg.dFilter * filteredDerivative +
+    (1.0f - cfg.dFilter) * rawD;
 }
 
-float adaptiveBase(float absError) {
-  const float x[] = {0.00f, 0.10f, 0.20f, 0.30f, 0.40f, 0.50f, 0.60f, 0.70f, 0.80f, 0.90f, 1.00f};
-  const float y[] = {1.00f, 0.99f, 0.97f, 0.94f, 0.90f, 0.85f, 0.78f, 0.70f, 0.60f, 0.50f, 0.40f};
+float runPID(float error, PIDConfig &cfg) {
+  updateDerivative(error);
 
-  absError = clampf(absError, 0.0f, 1.0f);
+  uint32_t now = micros();
+  if (lastPidUs == 0) lastPidUs = now;
+
+  uint32_t dtUs = now - lastPidUs;
+  lastPidUs = now;
+
+  float dt = clampf((float)dtUs * 0.000001f, 0.0005f, 0.05f);
+
+  float p = cfg.kp * error;
+  float d = cfg.kd * filteredDerivative;
+
+  float candidateIntegral =
+    clampf(
+      integral + error * dt,
+      -cfg.integralLimit,
+      cfg.integralLimit
+    );
+
+  float unsaturated =
+    cfg.sign * (p + cfg.ki * candidateIntegral + d);
+
+  bool saturated = fabsf(unsaturated) > cfg.maxCorrection;
+
+  if (!saturated || ((unsaturated > 0.0f) != (error * cfg.sign > 0.0f))) {
+    integral = candidateIntegral;
+  }
+
+  float correction =
+    cfg.sign * (
+      p +
+      cfg.ki * integral +
+      d
+    );
+
+  return clampf(
+    correction,
+    -cfg.maxCorrection,
+    cfg.maxCorrection
+  );
+}
+
+float adaptiveBase(float error) {
+  const float x[11] = {
+    0.00f, 0.10f, 0.20f, 0.30f, 0.40f, 0.50f,
+    0.60f, 0.70f, 0.80f, 0.90f, 1.00f
+  };
+
+  const float y[11] = {
+    1.00f, 0.99f, 0.97f, 0.94f, 0.90f, 0.85f,
+    0.78f, 0.70f, 0.60f, 0.50f, 0.40f
+  };
+
+  error = clampf(fabsf(error), 0.0f, 1.0f);
 
   float factor = y[10];
+
   for (uint8_t i = 1; i < 11; ++i) {
-    if (absError <= x[i]) {
-      float t = (absError - x[i - 1]) / (x[i] - x[i - 1]);
+    if (error <= x[i]) {
+      float t = (error - x[i - 1]) / (x[i] - x[i - 1]);
       factor = y[i - 1] + t * (y[i] - y[i - 1]);
       break;
     }
   }
 
-  float base = cfg.base * factor;
-  return clampf(base, cfg.minBase, cfg.maxBase);
+  return clampf(
+    lineCfg.base * factor,
+    0.0f,
+    255.0f
+  );
 }
 
-void lineStep() {
+void lineControlStep() {
   uint32_t now = micros();
-  if ((uint32_t)(now - lastControlUs) < CONTROL_PERIOD_US) return;
-  lastControlUs = now;
+
+  if (now - lastLineControlUs < LINE_PERIOD_US) return;
+  lastLineControlUs = now;
 
   sampleLine();
 
-  if (!line.valid) {
-    if (millis() - lastValidLineMs > LOST_TIMEOUT_MS) {
-      int search = lastLineSide > 0 ? 85 : -85;
+  if (!lineState.valid) {
+    if (millis() - lastValidLineMs > LINE_LOST_MS) {
+      int search = lastLineSide > 0 ? 75 : -75;
       setTank(-search, search);
     } else {
-      setTank((int)cfg.base, (int)cfg.base);
+      int base = (int)lineCfg.base;
+      setTank(base, base);
     }
     return;
   }
 
-  updateDerivative(line.error);
+  float correction = runPID(lineState.error, lineCfg);
 
-  float dt = CONTROL_PERIOD_US * 0.000001f;
-  integral += line.error * dt;
-  integral = clampf(integral, -cfg.integralLimit, cfg.integralLimit);
-
-  float correction =
-      cfg.kp * line.error
-    + cfg.ki * integral
-    + cfg.kd * filteredDerivative;
-
-  correction = clampf(correction, -255.0f, 255.0f);
-
-  float base = adaptiveEnabled
-    ? adaptiveBase(fabsf(line.error))
-    : clampf(cfg.base, cfg.minBase, cfg.maxBase);
+  float base = adaptiveLine
+    ? adaptiveBase(lineState.error)
+    : clampf(lineCfg.base, 0.0f, 255.0f);
 
   int left = clampi((int)lroundf(base + correction), -255, 255);
   int right = clampi((int)lroundf(base - correction), -255, 255);
@@ -431,118 +596,432 @@ void lineStep() {
   setTank(left, right);
 }
 
-void printSensors() {
-  sampleLine();
-  Serial.print("raw:");
-  for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-    Serial.printf(" %u", line.rawUs[i]);
+bool initToFs() {
+  for (uint8_t i = 0; i < TOF_COUNT; ++i) {
+    selectMux(TOF_CHANNEL[i]);
+    tof[i].setBus(&Wire);
+    tof[i].setTimeout(TOF_TIMEOUT_MS);
+
+    if (!tof[i].init()) {
+      deselectMux();
+      return false;
+    }
+
+    tof[i].setMeasurementTimingBudget(20000);
+    tof[i].startContinuous(TOF_PERIOD_MS);
   }
-  Serial.print(" strength:");
-  for (uint8_t i = 0; i < QTR_COUNT; ++i) {
-    Serial.printf(" %u", line.strength[i]);
-  }
-  Serial.printf(" mask=0x%02X err=%.4f valid=%d\n", line.mask, line.error, line.valid);
+
+  deselectMux();
+  return true;
 }
 
-void printConfig() {
-  Serial.printf(
-    "KP=%.5f KI=%.5f KD=%.5f BASE=%.1f MIN=%.1f MAX=%.1f DF=%.3f I=%.3f\n",
-    cfg.kp, cfg.ki, cfg.kd, cfg.base, cfg.minBase, cfg.maxBase, cfg.dFilter, cfg.integralLimit
+bool readToFOne(uint8_t i) {
+  selectMux(TOF_CHANNEL[i]);
+
+  uint16_t d = tof[i].readRangeContinuousMillimeters();
+  bool timeout = tof[i].timeoutOccurred();
+
+  deselectMux();
+
+  if (timeout || d == 0 || d == 65535) {
+    tofValid[i] = false;
+    return false;
+  }
+
+  tofMM[i] = d;
+  tofValid[i] = true;
+  return true;
+}
+
+void readAllToFsOnce() {
+  for (uint8_t i = 0; i < TOF_COUNT; ++i) {
+    readToFOne(i);
+  }
+}
+
+void updateToFs() {
+  uint32_t now = millis();
+
+  if (now - lastToFMs < 5) return;
+  lastToFMs = now;
+
+  readToFOne(tofRoundRobin);
+  tofRoundRobin = (tofRoundRobin + 1) % TOF_COUNT;
+}
+
+void updateIMU() {
+  if (!imuReady) return;
+
+  sensors_event_t a;
+  sensors_event_t g;
+  sensors_event_t t;
+
+  mpu.getEvent(&a, &g, &t);
+
+  uint32_t now = micros();
+
+  if (lastIMUUs == 0) {
+    lastIMUUs = now;
+    return;
+  }
+
+  uint32_t dtUs = now - lastIMUUs;
+  lastIMUUs = now;
+
+  if (dtUs > 100000) return;
+
+  float dt = (float)dtUs * 0.000001f;
+
+  float zDegPerSec =
+    g.gyro.z * 180.0f / PI;
+
+  zDegPerSec -= gyroBiasZ;
+  zDegPerSec *= gyroScale;
+
+  yawDeg = wrapAngle(
+    yawDeg + zDegPerSec * dt
   );
+}
+
+void calibrateGyro() {
+  stopMotors();
+
+  Serial.println("GYRO STILL 2 SEC");
+
+  delay(500);
+
+  float sum = 0.0f;
+  uint16_t count = 0;
+
+  uint32_t start = millis();
+
+  while (millis() - start < 2000) {
+    sensors_event_t a;
+    sensors_event_t g;
+    sensors_event_t t;
+
+    mpu.getEvent(&a, &g, &t);
+    sum += g.gyro.z * 180.0f / PI;
+    ++count;
+    delay(2);
+  }
+
+  if (count) {
+    gyroBiasZ = sum / (float)count;
+  }
+
+  yawDeg = 0.0f;
+  lastIMUUs = micros();
+
+  Serial.printf("GYRO BIAS %.5f DEG/S\n", gyroBiasZ);
+}
+
+float wallError() {
+  if (wallMode == 0) {
+    if (!tofValid[LEFT_TOF] || !tofValid[RIGHT_TOF]) return 0.0f;
+    return ((float)tofMM[LEFT_TOF] - (float)tofMM[RIGHT_TOF]) * 0.5f;
+  }
+
+  if (wallMode == 1) {
+    if (!tofValid[LEFT_TOF]) return 0.0f;
+    return (float)wallTargetMM - (float)tofMM[LEFT_TOF];
+  }
+
+  if (!tofValid[RIGHT_TOF]) return 0.0f;
+  return (float)tofMM[RIGHT_TOF] - (float)wallTargetMM;
+}
+
+void wallControlStep() {
+  updateToFs();
+
+  if (
+    frontSafety &&
+    tofValid[FRONT_TOF] &&
+    tofMM[FRONT_TOF] <= frontStopMM
+  ) {
+    stopMotors();
+    return;
+  }
+
+  float error = wallError();
+  float correction = runPID(error, wallCfg);
+
+  int base = clampi((int)wallCfg.base, 0, 255);
+  int left = clampi((int)lroundf(base + correction), -255, 255);
+  int right = clampi((int)lroundf(base - correction), -255, 255);
+
+  setTank(left, right);
+}
+
+void headingControlStep(bool turnMode) {
+  updateIMU();
+
+  float error = wrapAngle(
+    headingTargetDeg - yawDeg
+  );
+
+  float correction = runPID(
+    error,
+    headingCfg
+  );
+
+  if (turnMode) {
+    int left = clampi((int)lroundf(correction), -255, 255);
+    int right = clampi((int)lroundf(-correction), -255, 255);
+
+    if (fabsf(error) <= 1.5f) {
+      stopMotors();
+      mode = MODE_STOP;
+      resetPID();
+      return;
+    }
+
+    setTank(left, right);
+    return;
+  }
+
+  int base = clampi((int)headingCfg.base, 0, 255);
+  int left = clampi((int)lroundf(base + correction), -255, 255);
+  int right = clampi((int)lroundf(base - correction), -255, 255);
+
+  setTank(left, right);
 }
 
 void saveConfig() {
   prefs.begin("pid", false);
-  prefs.putFloat("kp", cfg.kp);
-  prefs.putFloat("ki", cfg.ki);
-  prefs.putFloat("kd", cfg.kd);
-  prefs.putFloat("base", cfg.base);
-  prefs.putFloat("min", cfg.minBase);
-  prefs.putFloat("max", cfg.maxBase);
-  prefs.putFloat("df", cfg.dFilter);
-  prefs.putFloat("ilim", cfg.integralLimit);
+
+  const char *names[3] = {"line", "wall", "head"};
+  PIDConfig *configs[3] = {&lineCfg, &wallCfg, &headingCfg};
+
+  for (uint8_t i = 0; i < 3; ++i) {
+    char k[24];
+
+    snprintf(k, sizeof(k), "%s_kp", names[i]);
+    prefs.putFloat(k, configs[i]->kp);
+    snprintf(k, sizeof(k), "%s_ki", names[i]);
+    prefs.putFloat(k, configs[i]->ki);
+    snprintf(k, sizeof(k), "%s_kd", names[i]);
+    prefs.putFloat(k, configs[i]->kd);
+    snprintf(k, sizeof(k), "%s_base", names[i]);
+    prefs.putFloat(k, configs[i]->base);
+    snprintf(k, sizeof(k), "%s_ilim", names[i]);
+    prefs.putFloat(k, configs[i]->integralLimit);
+    snprintf(k, sizeof(k), "%s_df", names[i]);
+    prefs.putFloat(k, configs[i]->dFilter);
+    snprintf(k, sizeof(k), "%s_max", names[i]);
+    prefs.putFloat(k, configs[i]->maxCorrection);
+    snprintf(k, sizeof(k), "%s_sign", names[i]);
+    prefs.putFloat(k, configs[i]->sign);
+  }
+
+  prefs.putUShort("wall_mm", wallTargetMM);
+  prefs.putUShort("front_mm", frontStopMM);
+
   prefs.end();
-  Serial.println("PID SAVE OK");
+
+  Serial.println("SAVE OK");
 }
 
-bool loadConfig() {
+void loadConfig() {
   prefs.begin("pid", true);
-  cfg.kp = prefs.getFloat("kp", DEFAULT_KP);
-  cfg.ki = prefs.getFloat("ki", DEFAULT_KI);
-  cfg.kd = prefs.getFloat("kd", DEFAULT_KD);
-  cfg.base = prefs.getFloat("base", DEFAULT_BASE);
-  cfg.minBase = prefs.getFloat("min", DEFAULT_MIN_BASE);
-  cfg.maxBase = prefs.getFloat("max", DEFAULT_MAX_BASE);
-  cfg.dFilter = prefs.getFloat("df", DEFAULT_D_FILTER);
-  cfg.integralLimit = prefs.getFloat("ilim", 0.8f);
+
+  const char *names[3] = {"line", "wall", "head"};
+  PIDConfig *configs[3] = {&lineCfg, &wallCfg, &headingCfg};
+
+  for (uint8_t i = 0; i < 3; ++i) {
+    char k[24];
+
+    snprintf(k, sizeof(k), "%s_kp", names[i]);
+    configs[i]->kp = prefs.getFloat(k, configs[i]->kp);
+    snprintf(k, sizeof(k), "%s_ki", names[i]);
+    configs[i]->ki = prefs.getFloat(k, configs[i]->ki);
+    snprintf(k, sizeof(k), "%s_kd", names[i]);
+    configs[i]->kd = prefs.getFloat(k, configs[i]->kd);
+    snprintf(k, sizeof(k), "%s_base", names[i]);
+    configs[i]->base = prefs.getFloat(k, configs[i]->base);
+    snprintf(k, sizeof(k), "%s_ilim", names[i]);
+    configs[i]->integralLimit = prefs.getFloat(k, configs[i]->integralLimit);
+    snprintf(k, sizeof(k), "%s_df", names[i]);
+    configs[i]->dFilter = prefs.getFloat(k, configs[i]->dFilter);
+    snprintf(k, sizeof(k), "%s_max", names[i]);
+    configs[i]->maxCorrection = prefs.getFloat(k, configs[i]->maxCorrection);
+    snprintf(k, sizeof(k), "%s_sign", names[i]);
+    configs[i]->sign = prefs.getFloat(k, configs[i]->sign);
+  }
+
+  wallTargetMM = prefs.getUShort("wall_mm", wallTargetMM);
+  frontStopMM = prefs.getUShort("front_mm", frontStopMM);
+
   prefs.end();
-  return true;
 }
 
-bool setNamedFloat(const String &name, float value) {
-  if (name == "kp") cfg.kp = value;
-  else if (name == "ki") cfg.ki = value;
-  else if (name == "kd") cfg.kd = value;
-  else if (name == "base") cfg.base = value;
-  else if (name == "min") cfg.minBase = value;
-  else if (name == "max") cfg.maxBase = value;
-  else if (name == "df") cfg.dFilter = clampf(value, 0.0f, 0.99f);
-  else if (name == "ilim") cfg.integralLimit = fabsf(value);
-  else return false;
-  resetControllerState();
-  return true;
+void printConfig() {
+  PIDConfig &c = activeCfg();
+  const char *name =
+    mode == MODE_LINE ? "LINE" :
+    mode == MODE_WALL ? "WALL" :
+    mode == MODE_HEADING ? "HEADING" :
+    mode == MODE_TURN ? "TURN" : "STOP";
+
+  Serial.printf(
+    "%s KP=%.5f KI=%.5f KD=%.5f BASE=%.1f ILIM=%.3f DF=%.3f MAX=%.1f SIGN=%.1f\n",
+    name,
+    c.kp,
+    c.ki,
+    c.kd,
+    c.base,
+    c.integralLimit,
+    c.dFilter,
+    c.maxCorrection,
+    c.sign
+  );
+
+  Serial.printf(
+    "WALLMODE=%u TARGET=%u FRONTSTOP=%u FRONTSAFETY=%u ADAPT=%u\n",
+    wallMode,
+    wallTargetMM,
+    frontStopMM,
+    frontSafety,
+    adaptiveLine
+  );
 }
 
-void help() {
-  Serial.println("c=calibrate");
-  Serial.println("r=run");
-  Serial.println("s=stop");
-  Serial.println("p=print config");
-  Serial.println("v=print sensors");
-  Serial.println("save=save pid");
-  Serial.println("load=load pid");
-  Serial.println("adapt=0|1");
-  Serial.println("kp=val kd=val ki=val base=val min=val max=val df=val ilim=val");
+void printSensors() {
+  if (mode == MODE_LINE) {
+    sampleLine();
+
+    Serial.print("QTR:");
+    for (uint8_t i = 0; i < QTR_COUNT; ++i) {
+      Serial.printf(" %u", lineState.raw[i]);
+    }
+
+    Serial.print(" S:");
+    for (uint8_t i = 0; i < QTR_COUNT; ++i) {
+      Serial.printf(" %u", lineState.strength[i]);
+    }
+
+    Serial.printf(
+      " MASK=0x%02X ERR=%.4f VALID=%u\n",
+      lineState.mask,
+      lineState.error,
+      lineState.valid
+    );
+    return;
+  }
+
+  readAllToFsOnce();
+
+  Serial.printf(
+    "TOF L=%u(%u) F=%u(%u) R=%u(%u) WALLERR=%.2f\n",
+    tofMM[LEFT_TOF],
+    tofValid[LEFT_TOF],
+    tofMM[FRONT_TOF],
+    tofValid[FRONT_TOF],
+    tofMM[RIGHT_TOF],
+    tofValid[RIGHT_TOF],
+    wallError()
+  );
+
+  updateIMU();
+
+  Serial.printf(
+    "YAW=%.3f TARGET=%.3f ERR=%.3f\n",
+    yawDeg,
+    headingTargetDeg,
+    wrapAngle(headingTargetDeg - yawDeg)
+  );
+}
+
+void setMode(ControlMode newMode) {
+  stopMotors();
+  resetPID();
+  mode = newMode;
+
+  if (mode == MODE_HEADING) {
+    headingTargetDeg = yawDeg;
+  }
+
+  if (mode == MODE_TURN) {
+    headingTargetDeg = yawDeg;
+  }
+
+  printConfig();
+}
+
+void parseFloatCommand(String key, float value) {
+  if (key == "kp") activeCfg().kp = value;
+  else if (key == "ki") activeCfg().ki = value;
+  else if (key == "kd") activeCfg().kd = value;
+  else if (key == "base") activeCfg().base = clampf(value, 0.0f, 255.0f);
+  else if (key == "ilim") activeCfg().integralLimit = fabsf(value);
+  else if (key == "df") activeCfg().dFilter = clampf(value, 0.0f, 0.99f);
+  else if (key == "max") activeCfg().maxCorrection = clampf(fabsf(value), 1.0f, 255.0f);
+  else if (key == "sign") activeCfg().sign = value < 0 ? -1.0f : 1.0f;
+  else if (key == "target") headingTargetDeg = wrapAngle(value);
+  else if (key == "wall") wallTargetMM = clampi((int)value, 20, 1000);
+  else if (key == "front") frontStopMM = clampi((int)value, 20, 1000);
+  else return;
+
+  resetPID();
+  printConfig();
 }
 
 void handleCommand(String cmd) {
   cmd.trim();
   cmd.toLowerCase();
-  if (cmd.length() == 0) return;
 
-  if (cmd == "c") {
-    running = false;
-    stopMotors();
-    calibrateQTR();
-    resetControllerState();
+  if (cmd == "line") {
+    setMode(MODE_LINE);
     return;
   }
 
-  if (cmd == "r") {
-    if (!cal.valid) {
-      Serial.println("NO CAL");
-      return;
+  if (cmd == "wall") {
+    setMode(MODE_WALL);
+    return;
+  }
+
+  if (cmd == "heading") {
+    setMode(MODE_HEADING);
+    return;
+  }
+
+  if (cmd == "stop") {
+    setMode(MODE_STOP);
+    return;
+  }
+
+  if (cmd == "run") {
+    if (mode == MODE_STOP) {
+      Serial.println("SET MODE FIRST");
     }
-    resetControllerState();
-    running = true;
-    Serial.println("RUN");
+    resetPID();
     return;
   }
 
-  if (cmd == "s") {
-    running = false;
-    stopMotors();
-    Serial.println("STOP");
+  if (cmd == "cal") {
+    calibrateQTR();
     return;
   }
 
-  if (cmd == "p") {
-    printConfig();
+  if (cmd == "gyrocal") {
+    calibrateGyro();
     return;
   }
 
-  if (cmd == "v") {
-    printSensors();
+  if (cmd == "zero") {
+    yawDeg = 0.0f;
+    headingTargetDeg = 0.0f;
+    resetPID();
+    Serial.println("YAW ZERO");
+    return;
+  }
+
+  if (cmd.startsWith("turn=")) {
+    float delta = cmd.substring(5).toFloat();
+    headingTargetDeg = wrapAngle(yawDeg + delta);
+    resetPID();
+    mode = MODE_TURN;
+    Serial.printf("TURN TARGET %.2f\n", headingTargetDeg);
     return;
   }
 
@@ -553,42 +1032,116 @@ void handleCommand(String cmd) {
 
   if (cmd == "load") {
     loadConfig();
-    resetControllerState();
+    resetPID();
     printConfig();
     return;
   }
 
-  if (cmd.startsWith("adapt=")) {
-    adaptiveEnabled = cmd.substring(6).toInt() != 0;
-    Serial.printf("ADAPT=%d\n", adaptiveEnabled);
+  if (cmd == "sensors") {
+    printSensors();
+    return;
+  }
+
+  if (cmd == "p") {
+    printConfig();
+    return;
+  }
+
+  if (cmd == "center") {
+    wallMode = 0;
+    resetPID();
+    printConfig();
+    return;
+  }
+
+  if (cmd == "leftwall") {
+    wallMode = 1;
+    resetPID();
+    printConfig();
+    return;
+  }
+
+  if (cmd == "rightwall") {
+    wallMode = 2;
+    resetPID();
+    printConfig();
+    return;
+  }
+
+  if (cmd == "frontsafe=0") {
+    frontSafety = false;
+    printConfig();
+    return;
+  }
+
+  if (cmd == "frontsafe=1") {
+    frontSafety = true;
+    printConfig();
+    return;
+  }
+
+  if (cmd == "adapt=0") {
+    adaptiveLine = false;
+    printConfig();
+    return;
+  }
+
+  if (cmd == "adapt=1") {
+    adaptiveLine = true;
+    printConfig();
+    return;
+  }
+
+  if (cmd.startsWith("invfl=")) {
+    motorInvert[0] = cmd.substring(6).toInt() != 0;
+    return;
+  }
+
+  if (cmd.startsWith("invfr=")) {
+    motorInvert[1] = cmd.substring(6).toInt() != 0;
+    return;
+  }
+
+  if (cmd.startsWith("invrl=")) {
+    motorInvert[2] = cmd.substring(6).toInt() != 0;
+    return;
+  }
+
+  if (cmd.startsWith("invrr=")) {
+    motorInvert[3] = cmd.substring(6).toInt() != 0;
+    return;
+  }
+
+  int eq = cmd.indexOf('=');
+  if (eq > 0) {
+    String key = cmd.substring(0, eq);
+    float value = cmd.substring(eq + 1).toFloat();
+    parseFloatCommand(key, value);
     return;
   }
 
   if (cmd == "help" || cmd == "?") {
-    help();
+    Serial.println("line wall heading turn=90 stop");
+    Serial.println("cal gyrocal zero sensors p save load");
+    Serial.println("kp= ki= kd= base= ilim= df= max= sign=");
+    Serial.println("target= wall= front=");
+    Serial.println("center leftwall rightwall");
+    Serial.println("frontsafe=0|1 adapt=0|1");
+    Serial.println("invfl=0|1 invfr=0|1 invrl=0|1 invrr=0|1");
     return;
-  }
-
-  int sep = cmd.indexOf('=');
-  if (sep > 0) {
-    String name = cmd.substring(0, sep);
-    float value = cmd.substring(sep + 1).toFloat();
-    if (setNamedFloat(name, value)) {
-      printConfig();
-      return;
-    }
   }
 
   Serial.println("BAD CMD");
 }
 
-void readSerialCommands() {
+void readSerial() {
   while (Serial.available()) {
     char c = (char)Serial.read();
+
     if (c == '\n' || c == '\r') {
       handleCommand(commandLine);
       commandLine = "";
-    } else if (commandLine.length() < 80) {
+    } else if (commandLine.length() < 100) {
       commandLine += c;
     }
   }
@@ -603,10 +1156,7 @@ void setup() {
 
   if (!pca.begin()) {
     Serial.println("PCA9685 FAIL");
-    while (true) {
-      stopMotors();
-      delay(1000);
-    }
+    while (true) delay(1000);
   }
 
   pca.setPWMFreq(50);
@@ -621,35 +1171,76 @@ void setup() {
     pinMode(QTR_PINS[i], INPUT);
   }
 
-  loadCalibration();
   loadConfig();
-  resetControllerState();
+  loadQTRCalibration();
+  deselectMux();
+
+  if (!mpu.begin()) {
+    Serial.println("MPU FAIL");
+    imuReady = false;
+  } else {
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    calibrateGyro();
+    imuReady = true;
+  }
+
+  bool tofOk = initToFs();
+  Serial.println(tofOk ? "TOF OK" : "TOF FAIL");
+
+  bool qtrOk = qtrCalibrationValid();
+  Serial.println(qtrOk ? "QTR CAL LOADED" : "QTR CAL NEEDED");
+
   stopMotors();
+  mode = MODE_STOP;
 
-  initialized = true;
-
-  Serial.println("URC LINE PID TUNER");
-  Serial.println("115200");
-  Serial.println(cal.valid ? "QTR CAL LOADED" : "QTR CAL NEEDED");
+  Serial.println("URC UNIVERSAL PID TUNER");
+  Serial.println("TYPE HELP");
   printConfig();
-  help();
 }
 
 void loop() {
-  if (!initialized) return;
+  readSerial();
 
-  readSerialCommands();
-
-  if (running) {
-    lineStep();
+  if (mode == MODE_LINE) {
+    lineControlStep();
+  } else if (mode == MODE_WALL) {
+    wallControlStep();
+  } else if (mode == MODE_HEADING) {
+    headingControlStep(false);
+  } else if (mode == MODE_TURN) {
+    headingControlStep(true);
   } else {
     stopMotors();
   }
 
-  if (millis() - lastPrintMs >= 250) {
-    lastPrintMs = millis();
-    if (running) {
-      Serial.printf("e=%.4f d=%.3f base=%.1f mask=0x%02X\n", line.error, filteredDerivative, adaptiveEnabled ? adaptiveBase(fabsf(line.error)) : clampf(cfg.base, cfg.minBase, cfg.maxBase), line.mask);
+  uint32_t now = millis();
+  if (now - lastPrintMs >= 200) {
+    lastPrintMs = now;
+
+    if (mode == MODE_LINE) {
+      Serial.printf(
+        "LINE e=%.4f d=%.4f\n",
+        lineState.error,
+        filteredDerivative
+      );
+    } else if (mode == MODE_WALL) {
+      Serial.printf(
+        "WALL L=%u F=%u R=%u e=%.2f d=%.2f\n",
+        tofMM[LEFT_TOF],
+        tofMM[FRONT_TOF],
+        tofMM[RIGHT_TOF],
+        wallError(),
+        filteredDerivative
+      );
+    } else if (mode == MODE_HEADING || mode == MODE_TURN) {
+      Serial.printf(
+        "HEAD yaw=%.2f target=%.2f e=%.2f d=%.2f\n",
+        yawDeg,
+        headingTargetDeg,
+        wrapAngle(headingTargetDeg - yawDeg),
+        filteredDerivative
+      );
     }
   }
 }
